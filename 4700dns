@@ -1,0 +1,367 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, select, sys, threading
+from collections import defaultdict
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE
+
+class Server:
+    def __init__(self, root_ip, zone_file, port):
+        self.root_ip = root_ip
+        self.zone_file = zone_file
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("127.0.0.1", port))
+        self.port = self.socket.getsockname()[1]
+
+        self.log("Bound to port %d" % self.port)
+
+        # Parse zone file, initialize records and auth domain
+        self.parse_zone_file(zone_file)
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, addr, message):
+        self.log("Sending message:\n%s" % message)
+        self.socket.sendto(message.pack(), addr)
+    
+    """
+    Normalize a domain name for case insensitivity and trailing dot
+    """
+    def normalize_name(self, name) -> str:
+        s = str(name).lower()
+        return s if s.endswith('.') else s + '.'
+
+    """
+    This function checks if a provided domain name is in the zone of the server
+    True if qname is our authoritative domain or a subdomain
+    """
+    def is_in_zone(self, qname: str) -> bool:
+        return qname == self.auth_domain or qname.endswith("." + self.auth_domain)
+
+    """
+    This function adds glue records for NS answers to the response
+    """
+    def add_glue_for_ns_answers(self, response, ns_rrs):
+        seen = set()
+        for rr in ns_rrs:
+            # only add glue for NS records
+            if rr.rtype != QTYPE.NS:
+                continue
+            try:
+                host = self.normalize_name(rr.rdata.label)
+            except Exception:
+                self.log("error: bad NS hostname in glue")
+                continue
+            # only add glue for NS records that are in our zone
+            if not self.is_in_zone(host):
+                continue
+            # add glue for A and AAAA records
+            for t in (QTYPE.A, QTYPE.AAAA):
+                # get all glue records for the host and type
+                for glue in self.records.get((host, t), []):
+                    # only add glue record to response if it hasn't been added yet
+                    glue_record = (self.normalize_name(glue.rname), glue.rtype, str(glue.rdata))
+                    if glue_record in seen:
+                        continue
+                    seen.add(glue_record)
+                    response.add_ar(glue)
+
+    """
+    This function handles the case where query is for within our authoritative domain
+    It doesn't need to make any queries to other servers and can just return answers
+    straight from stored records
+    """
+    def handle_in_domain(self, request):
+        qname = self.normalize_name(request.q.qname)
+        qtype = request.q.qtype
+        response = request.reply()
+        response.header.aa = 1 # set to 1 b/c query is about authoritative domain
+
+        # Check if there are any answers in our saved records for the query
+        answers = self.records.get((qname, qtype), [])
+        if answers:
+            for rr in answers:
+                response.add_answer(rr) 
+            if qtype == QTYPE.NS:
+                self.add_glue_for_ns_answers(response, answers)
+            return response
+
+        if qtype not in (QTYPE.NS, QTYPE.SOA, QTYPE.CNAME):
+            visited = set()
+            cur = qname
+            max_depth = 10
+
+            # Follow CNAME chains up to the max depth
+            for _ in range(max_depth):
+                if cur in visited:
+                    break
+                visited.add(cur)
+
+                # Get CNAME records for the current domain
+                cnames = self.records.get((cur, QTYPE.CNAME), [])
+
+                
+                if not cnames:
+                    break
+
+                # add CNAME records to response
+                for rr in cnames:
+                    response.add_answer(rr)
+                
+                # Get the target domain from the CNAME record
+                try:
+                    target = self.normalize_name(cnames[0].rdata.label)
+                except Exception:
+                    self.log("error: bad CNAME target in zone")
+                    break
+
+                # If target domain is not under our authoritative domain, return response
+                if not self.is_in_zone(target):
+                    return response
+                
+                # Get the answers for the target domain
+                target_answers = self.records.get((target, qtype), [])
+                if target_answers:
+                    for rr in target_answers:
+                        response.add_answer(rr)
+                    return response
+
+                cur = target
+
+        # if name exists in zone but not this record type 
+        if qname in self.zone_owner_names:
+            response.header.rcode = RCODE.NOERROR
+            return response
+        response.header.rcode = RCODE.NXDOMAIN
+        return response
+
+    """
+    This function handles the case where query is for outside our authoritative domain
+    It needs to make queries to other servers to resolve the query
+    """
+    def handle_out_domain(self, request):
+        qname = self.normalize_name(request.q.qname)
+        qtype = request.q.qtype
+
+        # the query request doesn't want recursion, so we just return SERVFAIL
+        if request.header.rd == 0:
+            response = request.reply()
+            response.header.rcode = RCODE.SERVFAIL
+            return response
+        
+        # recursively resolve the query by iteratively querying servers
+        # until we get an answer
+        resolved = self.resolve_recursive(qname, qtype)
+        if resolved is None:
+            response = request.reply()
+            response.header.rcode = RCODE.SERVFAIL
+            response.header.ra = 1 # recursion available
+            response.header.aa = 0 # not authoritative
+            return response
+
+        resolved.header.id = request.header.id # copy ID from request
+        resolved.header.rd = request.header.rd # copy rd from request
+        resolved.header.ra = 1 # recursion available
+        resolved.header.aa = 0 # not authoritative
+        resolved.header.tc = 0 # not truncated
+        return resolved
+
+    """
+    Helper function to query a server for a record.
+    Given a server IP address, a query name, and a query type,
+    it sends a query to the server and returns the response
+    through UDP on port 60053
+    """
+    def query_server(self,server, qname, qtype, timeout=1.0):
+        q = DNSRecord.question(qname, QTYPE[qtype])
+        q.header.rd = 0
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(timeout)
+            sock.sendto(q.pack(), (server, 60053))
+            data, _ = sock.recvfrom(65535)
+            return DNSRecord.parse(data)
+        except (socket.timeout, OSError):
+            self.log("error: query timeout or network error")
+            return None
+        except Exception:
+            self.log("error: query failed")
+            return None
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                self.log("error: socket close failed")
+
+
+    """
+    This function recursively resolves a query by querying other servers
+    The function effectively loops through a set of actions:
+    - Send iterative queries to servers starting from the root
+    - Follow CNAME chains (with a visited set to detect loops)
+    - Follow NS referrals using glue A/AAAA records or by
+    resolving the NS hostname if glue records not found
+    - Get a final answer from whichever server has it and return it
+    """
+    def resolve_recursive(self, qname, qtype):
+        servers = [self.root_ip]
+
+        cname_visited = set()
+
+        while True:
+            if not servers:
+                return None
+
+            server_ip = servers.pop(0)
+            response = self.query_server(server_ip, qname, qtype)
+            # if no response from current server, try next server if it exists
+            if response is None:
+                continue
+
+            # if response is error, return response
+            if response.header.rcode != RCODE.NOERROR:
+                return response
+
+            # if we got the requested answer type with the correct name, return response
+            # NS answers may appear either in the answer or authority sections
+            if any(
+                self.normalize_name(rr.rname) == qname and rr.rtype == qtype
+                for rr in list(response.rr) + list(response.auth)
+            ):
+                return response
+
+            # if we got CNAME, resolve the target name of the alias
+            target = None
+            for rr in response.rr:
+                if self.normalize_name(rr.rname) == qname and rr.rtype == QTYPE.CNAME:
+                    try:
+                        target = self.normalize_name(rr.rdata.label)
+                    except Exception:
+                        self.log("error: bad CNAME in server response")
+                        continue
+                    break
+            if target is not None:
+                if target in cname_visited:
+                    return None
+                cname_visited.add(target)
+                qname = target
+                servers = [self.root_ip]
+                continue
+
+            # if referred to another server, add NS IPs to servers to query next
+            ns_names = []
+            # check both authority and answer sections for NS records
+            for rr in list(response.auth) + list(response.rr):
+                if rr.rtype == QTYPE.NS:
+                    try:
+                        ns_names.append(self.normalize_name(rr.rdata.label))
+                    except Exception:
+                        self.log("error: bad NS hostname in referral")
+                        continue
+            if not ns_names:
+                return response
+
+            # if there are glue records (in ADDITIONAL section), we can get
+            # IP addresses of the NS servers, we can use them in future
+            # queries
+            ns_set = set(ns_names)
+            glue_ips = []
+            # check all records in ADDITIONAL section of server response
+            # if it is A or AAAA record and the owner is a NS server,
+            # add the IP address to the list of glue IPs
+            for rr in response.ar:
+                if rr.rtype in (QTYPE.A, QTYPE.AAAA):
+                    owner = self.normalize_name(rr.rname)
+                    if owner in ns_set:
+                        glue_ips.append(str(rr.rdata))
+            if glue_ips:
+                servers = glue_ips
+                continue
+
+            # no glue records so we need to resolve the NS hostname to an IP
+            ns_name = ns_names[0]
+            ns_resp = self.resolve_recursive(ns_name, QTYPE.A)
+            if ns_resp is None:
+                return None
+            # pick first A record in answer section
+            ns_ip = None
+            for rr in ns_resp.rr:
+                if self.normalize_name(rr.rname) == self.normalize_name(ns_name) and rr.rtype == QTYPE.A:
+                    ns_ip = str(rr.rdata)
+                    break
+            if ns_ip is None:
+                return None
+
+            servers = [ns_ip]
+            continue
+
+    # changed to handle_req so that server can handle multiple requests at once
+    def handle_req(self, data, addr):
+        # Unpack the DNS request
+        try:
+            request = DNSRecord.parse(data)
+        except Exception:
+            self.log("error: malformed DNS packet")
+            return
+        self.log("Received message:\n%s" % request)
+
+        if len(request.questions) != 1:
+            response = request.reply()
+            response.header.rcode = RCODE.SERVFAIL
+            self.send(addr, response)
+            return
+
+        qname = self.normalize_name(request.q.qname)
+        if self.is_in_zone(qname):
+            response = self.handle_in_domain(request)
+            self.send(addr, response)
+            return
+
+        response = self.handle_out_domain(request)
+        self.send(addr, response)
+
+    """
+    This function receives a request from a client and handles it
+    using a background thread so that the server can handle multiple requests at once
+    """
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+        t = threading.Thread(target=self.handle_req, args=(data, addr))
+        t.start()
+
+    """
+    This function parses the zone file and initializes the server's records
+    """
+    def parse_zone_file(self, zone_file):
+        zone_txt = open(zone_file, 'r', encoding='utf-8').read()
+        zone_RRs = RR.fromZone(zone_txt)
+        self.records = defaultdict(list)
+        self.auth_domain = None
+        self.zone_owner_names = set()
+        for r in zone_RRs:
+            if r.rtype == QTYPE.SOA and self.auth_domain is None:
+                self.auth_domain = self.normalize_name(r.rname)
+            owner = self.normalize_name(r.rname)
+            self.zone_owner_names.add(owner)
+            self.records[(owner, r.rtype)].append(r)
+
+    def run(self):
+        seq = 0
+        while True:
+            socks = select.select([self.socket], [], [], 0.1)[0]
+            for conn in socks:
+                self.recv(conn)
+
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('root_ip', type=str, help="The IP address of the root server")
+    parser.add_argument('zone', type=str, help="The zone file for this server")
+    parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+    sender = Server(args.root_ip, args.zone, args.port)
+    sender.run()
