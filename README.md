@@ -20,9 +20,23 @@ If the given query asks about a domain that is outside the server's authority, t
 - Find a final answer if the response has a record matching the qname and qtype of the client's question
 - Build the response for the client + copy flags from client request and clear truncate flag
 
-### ADD DETAILS FOR STEPS 5-9
+### Recursive Resolver Implementation
+Each iterative query starts at the closest server we know about. We check the cache for the closest parent zone with NS records, and if nothing is cached we fall back to the root IP from the command line. Then we loop:
+- Send the query with RD = 0 over UDP port 60053
+- Drop any records outside the responding server's bailiwick
+- Cache the surviving records (only on NOERROR)
+- If we got the answer, return it
+- If we got a CNAME, recurse on the target with the chain accumulated
+- If we got a referral, pick the next servers from glue A records, or resolve the NS hostname if no glue was provided
 
-The processes above can be done concurrently if there are multiple client requests incoming. 
+### Caching
+Our cache is a thread-safe dict keyed by (name, qtype). Each entry stores the original RR and its expiry time. We skip TTL = 0 records, dedupe by rdata, evict expired entries on get, and return RRs with TTLs decremented. NS answers served from cache also pull their A glue from the cache so the additional section still matches.
+
+### Bailiwick Checking
+Every upstream response is filtered before we cache or use it. A record is in bailiwick if its name equals or is a subdomain of the zone we just queried. The root server is in bailiwick of . so its records always pass. After filtering we re-sync the header counts.
+
+### Concurrency
+The processes above can be done concurrently if there are multiple client requests incoming. Each incoming packet is handed off to a new thread so the main loop can keep listening. The cache uses a lock so threads can put/get safely.
 
 ## Challenges
 
@@ -41,15 +55,16 @@ Since DNS server responses may vary wildly, we had to thoroughly check that all 
 - non NOERROR rcode from a server being queried
 - successful answer found
 
+### Getting the cache to behave like a real resolver
+Caching looked simple at first but had a few parts. We had to count TTLs down between hits, never cache error responses, and make sure NS answers from cache still carried their glue A records. Filtering by bailiwick before caching was important so an upstream couldn't push records for zones it didn't own.
+
 ### Features of Design We Consider Good
 - Clear split between questions for domains in server authority vs outside
 - Handling all header matching for returning answers to clients
 - Concurrency being handled via multithreading
 - Organization of code into smaller helpers
+- Cache and bailiwick logic kept in their own helpers so the resolver loop stays readable
 
 ### Testing
 - After every major step mentioned in the Assignment Description's Implementation Strategy, we ran the relevant tests. We only moved on if all tests for a given step passed. 
 - After completing the entire project, we ran the test suite fully and also used the automatic tests on Gradescope to double check.
-
-
-
