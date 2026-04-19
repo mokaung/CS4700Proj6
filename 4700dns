@@ -5,12 +5,11 @@ from collections import defaultdict
 from dnslib import DNSRecord, DNSHeader, DNSQuestion, RR, QTYPE, RCODE
 
 """
-Thread-safe DNS cache keyed by (name, type) that respects each record's TTL
+Thread-safe DNS cache keyed by name and type
 """
 class Cache:
     def __init__(self):
         self.lock = threading.Lock()
-        # (name, qtype) -> list of (rr, expiry_epoch)
         self.store = {}
 
     """
@@ -21,7 +20,7 @@ class Cache:
         return s if s.endswith('.') else s + '.'
 
     """
-    Add a record to the cache, skipping non-positive TTLs and deduping rdata
+    Add a record to the cache skipping non-positive TTLs and deduping rdata
     """
     def put(self, rr):
         try:
@@ -40,8 +39,8 @@ class Cache:
             self.store[key] = existing
 
     """
-    Return fresh RR copies for the given name/type with TTLs decremented;
-    evicts expired entries
+    Return RR copies for the given name/type with TTLs recomputed to now minus expiry time
+    without expired entries and returns an empty list if no valid entries are found
     """
     def get(self, name, qtype):
         key = (self._norm(name), qtype)
@@ -61,8 +60,8 @@ class Cache:
         return out
 
     """
-    Return (zone, ips) of the closest cached parent zone of name that has
-    both NS records and matching A glue, or (None, None) if none cached
+    Return zone and ips of the closest cached parent zone of name that has
+    both NS records and matching A glue rec
     """
     def best_ns(self, name):
         n = self._norm(name).rstrip('.')
@@ -96,12 +95,12 @@ class Server:
         self.socket.bind(("127.0.0.1", port))
         self.port = self.socket.getsockname()[1]
 
-        self.log("Bound to port %d" % self.port)
+        print("Bound to port %d" % self.port, flush=True)
 
-        # Parse zone file, initialize records and auth domain
+        # Parse zone file + initialize records and auth domain
         self.parse_zone_file(zone_file)
 
-        # Cache for upstream answers/auth/additional records
+        # Cache for upstream answers, auth, and additional records
         self.cache = Cache()
 
     def log(self, message):
@@ -143,7 +142,7 @@ class Server:
         response.rr = [r for r in response.rr if self.in_bailiwick(r.rname, bailiwick)]
         response.auth = [r for r in response.auth if self.in_bailiwick(r.rname, bailiwick)]
         response.ar = [r for r in response.ar if self.in_bailiwick(r.rname, bailiwick)]
-        # keep header section counts in sync after the in-place filter
+        # keep header section counts synced after filtering
         try:
             response.set_header_qa()
         except Exception:
@@ -152,10 +151,10 @@ class Server:
             response.header.ar = len(response.ar)
 
     """
-    Build a DNS response from given records (used for cache hits and
-    for splicing a CNAME chain onto the final answer)
+    Build a DNS response from given records
+    used for cache hits and splicing a CNAME chain onto the final answer
     """
-    def synth_response(self, qname, qtype, answers, auth=None, ar=None,
+    def create_res(self, qname, qtype, answers, auth=None, ar=None,
                        rcode=RCODE.NOERROR):
         response = DNSRecord(DNSHeader(qr=1, ra=1, rd=1, rcode=rcode),
                              q=DNSQuestion(qname, qtype))
@@ -249,6 +248,9 @@ class Server:
                 # If CNAME points outside our zone, recursively resolve
                 # the rest of the chain so the client still gets an answer
                 if not self.is_in_zone(target):
+                    if qtype != QTYPE.CNAME and request.header.rd == 0:
+                        response.header.rcode = RCODE.SERVFAIL
+                        return response
                     if qtype != QTYPE.CNAME and request.header.rd == 1:
                         sub = self.resolve_recursive(target, qtype)
                         if sub is not None and sub.header.rcode == RCODE.NOERROR:
@@ -357,7 +359,7 @@ class Server:
     - Get a final answer from whichever server has it and return it
     """
     def resolve_recursive(self, qname, qtype, depth=0, cname_chain=None):
-        # bound recursion depth so a malicious chain can't loop forever
+        # set a recursion depth limitso a malicious chain can't loop forever
         if depth > 16:
             return None
         if cname_chain is None:
@@ -377,10 +379,10 @@ class Server:
                         continue
                     for a in self.cache.get(host, QTYPE.A):
                         glue.append(a)
-            return self.synth_response(qname, qtype, list(cname_chain) + cached,
+            return self.create_res(qname, qtype, list(cname_chain) + cached,
                                        ar=glue if glue else None)
 
-        # cache hit for a CNAME on this name; chase its target
+        # cache hit for a CNAME on this name so we chase target
         if qtype != QTYPE.CNAME:
             cached_cname = self.cache.get(qname, QTYPE.CNAME)
             if cached_cname:
@@ -390,12 +392,12 @@ class Server:
                     target = None
                 if target is not None:
                     if any(self.normalize_name(c.rname) == target for c in cname_chain):
-                        return self.synth_response(qname, qtype,
+                        return self.create_res(qname, qtype,
                                                    list(cname_chain) + cached_cname)
                     return self.resolve_recursive(target, qtype, depth + 1,
                                                   list(cname_chain) + cached_cname)
 
-        # use closest cached parent zone if we know one, otherwise root
+        # use closest cached parent zone if we know one else root
         zone, cached_ips = self.cache.best_ns(qname)
         if cached_ips:
             servers = list(cached_ips)
@@ -409,7 +411,7 @@ class Server:
             bailiwick = bailiwicks.pop(0)
 
             response = self.query_server(server_ip, qname, qtype)
-            # if no response from current server, try next server if it exists
+            # if no response from curr server try next server if it exists
             if response is None:
                 continue
 
@@ -432,7 +434,7 @@ class Server:
                 for rr in list(response.rr) + list(response.auth)
             ):
                 if cname_chain:
-                    return self.synth_response(qname, qtype,
+                    return self.create_res(qname, qtype,
                                                list(cname_chain) + list(response.rr),
                                                auth=list(response.auth),
                                                ar=list(response.ar))
@@ -470,19 +472,19 @@ class Server:
                         self.log("error: bad NS hostname in referral")
                         continue
             if not ns_names:
-                # no referral or answer; hand back what we have
+                # no referral or answer so return what we have
                 if cname_chain:
-                    return self.synth_response(qname, qtype,
+                    return self.create_res(qname, qtype,
                                                list(cname_chain) + list(response.rr),
                                                auth=list(response.auth),
                                                ar=list(response.ar))
                 return response
 
-            # next bailiwick is the delegated zone (already in current one)
+            # next bailiwick is the delegated zone
             new_bw = ns_zone if ns_zone else bailiwick
 
             # if there are glue records (in ADDITIONAL section), we can get
-            # IP addresses of the NS servers, we can use them in future
+            # IP addresses of the NS servers and we can use them in future
             # queries
             ns_set = set(ns_names)
             glue_ips = []
@@ -534,6 +536,13 @@ class Server:
             self.log("error: malformed DNS packet")
             return
         self.log("Received message:\n%s" % request)
+
+        # rej requests from non-local clients
+        if addr[0] != "127.0.0.1":
+            response = request.reply()
+            response.header.rcode = RCODE.REFUSED
+            self.send(addr, response)
+            return
 
         if len(request.questions) != 1:
             response = request.reply()
